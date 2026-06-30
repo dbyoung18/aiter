@@ -6,10 +6,10 @@
 # reference that is only compared (never timed/tabled), TFLOPS + TB/s per
 # candidate, one markdown summary table, and a __main__ guard).
 #
-# Two candidates per (intype, shape, apre) row -- both resolve to the same mi400
-# F4GEMM .co but exercise different entrypoints:
-#   gemm_a4w4 : the unified API the model calls (C++ heuristic picks the tile)
-#   asm       : the low-level asm entry with the tile kernel forced by name
+# One candidate per (intype, shape, apre) row: the unified gemm_a4w4 API the
+# model actually calls. The C++ heuristic (asm_f4gemm_mi400.cu) picks the tile
+# that fits the shape from the kernels registered in hsa/gfx1250/f4gemm/f4gemm.csv
+# -- so the row reflects the real, runtime-selected kernel (no tile is forced).
 #
 #   MXFP4 (intype=mxfp4): per_1x32 e8m0 scales, gfx1250 weight/scale shuffle
 #   NVFP4 (intype=nvfp4): e4m3 per-16 scales + per-tensor global scales
@@ -118,15 +118,15 @@ def _prep_nvfp4(M, N, K, apre, dtype, init):
 
 
 @benchmark()  # (intype, M, N, K, apre, init, dtype) become the table's left columns
-def test_gemm(intype, M, N, K, apre, init, dtype=dtypes.bf16):
+def test_gemm(intype, M, N, K, apre, init, dtype=dtypes.bf16, force_tile=None):
     block = MXFP4_SCALE_BLOCK if intype == "mxfp4" else NVFP4_SCALE_BLOCK
     assert K % block == 0, f"K must be a multiple of {block}"
     prep = _prep_mxfp4 if intype == "mxfp4" else _prep_nvfp4
     inp, ref = prep(M, N, K, apre, dtype, init)
 
     def run_unified():
-        # The path the model runs: unified API, C++ heuristic picks the tile.
-        # NVFP4 per-tensor global scales are passed as tensors here.
+        # The path the model runs: unified API, C++ heuristic picks the tile that
+        # fits the shape. NVFP4 per-tensor global scales are passed as tensors.
         gA = None if inp["gA"] is None else torch.tensor(inp["gA"], dtype=torch.float32)
         gB = None if inp["gB"] is None else torch.tensor(inp["gB"], dtype=torch.float32)
         return aiter.gemm_a4w4(
@@ -141,10 +141,11 @@ def test_gemm(intype, M, N, K, apre, init, dtype=dtypes.bf16):
             global_B_scale=gB,
         )
 
-    def run_asm():
-        # See hsa/gfx1250/f4gemm/f4gemm.csv.
+    def run_forced():
+        # Opt-in: bypass the heuristic and run the named kernel for force_tile.
+        # The .co must exist in hsa/gfx1250/f4gemm/f4gemm.csv for this tile/intype/apre.
         pre = "ABpreShuffle" if apre else "BpreShuffle"
-        base = f"f4gemm_bf16_{intype}_{pre}_256x256_4x4_ps"
+        base = f"f4gemm_bf16_{intype}_{pre}_{force_tile}_4x4_ps"
         knl = f"_ZN5aiter{len(base)}{base}E"
         if intype == "nvfp4":
             return aiter.gemm_nvfp4_asm(
@@ -168,8 +169,12 @@ def test_gemm(intype, M, N, K, apre, init, dtype=dtypes.bf16):
             kernelName=knl,
         )
 
-    candidates = {"gemm_a4w4": run_unified}
-    candidates["asm"] = run_asm
+    # Default: the single heuristic-selected path. With --force-tile, replace it
+    # with the explicitly-named asm kernel (column reflects the forced tile).
+    if force_tile is None:
+        candidates = {"gemm_a4w4": run_unified}
+    else:
+        candidates = {f"asm_{force_tile}": run_forced}
 
     flops = 2 * M * N * K
     nbytes = (
@@ -247,11 +252,23 @@ def main():
         default=[(16384, 16384, 16384)],
         help="(M,N,K) tuples, e.g. -mnk 2048,2048,2048 16384,16384,16384",
     )
+    parser.add_argument(
+        "--force-tile",
+        choices=["256x256", "128x512"],
+        default=None,
+        help="opt-in: bypass the C++ heuristic and run the named asm kernel for"
+        " this tile (column becomes 'asm_<tile>'). Default (unset) keeps the"
+        " single heuristic-selected gemm_a4w4 path. The shape must satisfy the"
+        " tile's constraints: 256x256 -> M%%1024==0 & N%%1024==0;"
+        " 128x512 -> M%%512==0 & N%%2048==0.",
+    )
     args = parser.parse_args()
 
     for dtype in args.dtype:  # one table per output dtype
         rows = [
-            test_gemm(intype, M, N, K, apre, init, dtype=dtype)
+            test_gemm(
+                intype, M, N, K, apre, init, dtype=dtype, force_tile=args.force_tile
+            )
             for intype, apre, init, (M, N, K) in itertools.product(
                 args.intype, args.apre, args.init, args.shape
             )
